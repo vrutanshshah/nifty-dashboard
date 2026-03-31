@@ -19,9 +19,10 @@ IST = pytz.timezone('Asia/Kolkata')
 class AlgoConfig:
     STRIKE_OFFSET = 100 
     SL_PCT = 0.20 
-    TAKE_PROFIT_PCT = 0.40      # NEW: 40% Take Profit target
-    TRAILING_SL_PCT = 0.10      # NEW: Trail SL 10% behind the highest price
-    LOT_SIZE = 25
+    TAKE_PROFIT_PCT = 0.40      
+    TRAILING_SL_PCT = 0.10      
+    LOT_SIZE = 65
+    NUM_LOTS = 3                # NEW: Set how many lots you want to trade here!
     TOLERANCE = 0.002
 
 if 'active_trade' not in st.session_state:
@@ -223,13 +224,13 @@ if live_data:
 
         if exit_reason:
             pnl_points = current_ltp - trade['entry_price']
-            pnl_inr = pnl_points * AlgoConfig.LOT_SIZE
+            # UPDATED: Multiply by NUM_LOTS for accurate INR P&L
+            pnl_inr = pnl_points * AlgoConfig.LOT_SIZE * AlgoConfig.NUM_LOTS 
             db.close_trade(trade['trade_id'], current_ltp, pnl_points, pnl_inr, exit_reason)
             st.warning(f"🔔 TRADE CLOSED ({exit_reason}): Exited at ₹{current_ltp:.2f} | P&L: ₹{pnl_inr:.2f}")
             st.session_state.active_trade = None
 
-    # --- UPDATED: Signal Generation (Only check if no active trade) ---
-    signal = None
+    # --- Signal Generation (Only check if no active trade) ---
     entry = 0
     sl = 0
     if not st.session_state.active_trade:
@@ -275,7 +276,8 @@ if live_data:
     if st.session_state.active_trade:
         tr = st.session_state.active_trade
         current_ltp = live_data['ce_ltp'] if 'CE' in tr['signal'] else live_data['pe_ltp']
-        unrealized_pnl = (current_ltp - tr['entry_price']) * AlgoConfig.LOT_SIZE
+        # UPDATED: Multiply unrealized P&L by NUM_LOTS
+        unrealized_pnl = (current_ltp - tr['entry_price']) * AlgoConfig.LOT_SIZE * AlgoConfig.NUM_LOTS 
         st.info(f"🟢 **ACTIVE POSITION:** {tr['signal']} | **Entry:** ₹{tr['entry_price']:.2f} | **Current LTP:** ₹{current_ltp:.2f} | **Trailing SL:** ₹{tr['current_sl']:.2f} | **Unrealized P&L:** ₹{unrealized_pnl:.2f}")
 
 else:
