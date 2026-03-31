@@ -219,3 +219,41 @@ if live_data:
         st.success(f"🚨 TRADE TRIGGERED: {signal} at ₹{entry:.2f} | Stoploss: ₹{sl:.2f}")
 else:
     st.warning("Fetching NSE Data... (Waiting for market open or bypassing rate limits. If market is closed, data will be unavailable.)")
+
+    # ==========================================
+# 6. Database Viewer (NEW SECTION)
+# ==========================================
+st.divider()
+st.markdown("### 🗄️ Database Records")
+
+# Create two tabs for viewing data
+tab_trades, tab_snapshots = st.tabs(["Trade Logs", "Market Snapshots"])
+
+# Connect to SQLite to read data
+conn = sqlite3.connect('nse_algo.db')
+
+with tab_trades:
+    st.write("History of all algorithmic trade signals:")
+    try:
+        # Fetch trade logs using pandas
+        df_trades = pd.read_sql_query("SELECT * FROM trade_logs ORDER BY entry_time DESC", conn)
+        if not df_trades.empty:
+            st.dataframe(df_trades, use_container_width=True)
+        else:
+            st.info("No trades logged yet.")
+    except Exception as e:
+        st.error(f"Could not load trades: {e}")
+
+with tab_snapshots:
+    st.write("Raw 1-minute market snapshots (Last 100 rows):")
+    try:
+        # Fetch market snapshots (limit to 100 so the app doesn't slow down)
+        df_snaps = pd.read_sql_query("SELECT * FROM market_snapshots ORDER BY timestamp DESC LIMIT 100", conn)
+        if not df_snaps.empty:
+            st.dataframe(df_snaps, use_container_width=True)
+        else:
+            st.info("No market data logged yet.")
+    except Exception as e:
+        st.error(f"Could not load snapshots: {e}")
+
+conn.close()
