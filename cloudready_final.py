@@ -13,12 +13,14 @@ import sqlite3
 # ==========================================
 # 1. Configuration & State
 # ==========================================
-st.set_page_config(page_title="Live NSE Options Algo", layout="wide", page_icon="⚡")
+st.set_page_config(page_title="Live Nifty Options Algo", layout="wide", page_icon="⚡")
 IST = pytz.timezone('Asia/Kolkata')
 
 class AlgoConfig:
     STRIKE_OFFSET = 100 
     SL_PCT = 0.20 
+    TAKE_PROFIT_PCT = 0.40      # NEW: 40% Take Profit target
+    TRAILING_SL_PCT = 0.10      # NEW: Trail SL 10% behind the highest price
     LOT_SIZE = 25
     TOLERANCE = 0.002
 
@@ -68,6 +70,16 @@ class DatabaseManager:
             return self.cursor.lastrowid
         except: 
             return None
+
+    def close_trade(self, trade_id, exit_price, pnl_points, pnl_inr, exit_reason):
+        try:
+            query = """UPDATE trade_logs 
+                       SET exit_time = ?, exit_price = ?, pnl_points = ?, pnl_inr = ?, status = ?
+                       WHERE trade_id = ?"""
+            self.cursor.execute(query, (datetime.now(), exit_price, pnl_points, pnl_inr, exit_reason, trade_id))
+            self.conn.commit()
+        except Exception as e: 
+            st.error(f"DB Close Trade Error: {e}")
 
 # ==========================================
 # 3. Live NSE API Scraper
@@ -186,20 +198,62 @@ if live_data:
     
     db.save_snapshot(live_data, ce_pat, pe_pat, ce_trend, pe_trend)
 
-    signal = None
-    if idx_dir == "Bullish" and ce_type == "Bullish" and pe_type == "Bearish":
-        signal = "BUY CE"
-        entry = live_data['ce_ltp']
-        sl = min(ce_df.iloc[-2]['Low'], entry * (1 - AlgoConfig.SL_PCT))
-    elif idx_dir == "Bearish" and pe_type == "Bullish" and ce_type == "Bearish":
-        signal = "BUY PE"
-        entry = live_data['pe_ltp']
-        sl = min(pe_df.iloc[-2]['Low'], entry * (1 - AlgoConfig.SL_PCT))
+    # --- NEW: Active Trade Management (Take Profit & Trailing SL) ---
+    if st.session_state.active_trade:
+        trade = st.session_state.active_trade
+        current_ltp = live_data['ce_ltp'] if 'CE' in trade['signal'] else live_data['pe_ltp']
+        
+        # 1. Update Highest Price Reached
+        if current_ltp > trade['highest_price']:
+            trade['highest_price'] = current_ltp
+            
+            # Recalculate Trailing SL (Locks in profit as price moves up)
+            new_trailing_sl = trade['highest_price'] * (1 - AlgoConfig.TRAILING_SL_PCT)
+            if new_trailing_sl > trade['current_sl']:
+                trade['current_sl'] = new_trailing_sl
 
-    if signal and not st.session_state.active_trade:
-        reason = f"CE: {ce_type}({ce_pat}) | PE: {pe_type}({pe_pat})"
-        trade_id = db.log_trade(signal, live_data['strike'], entry, sl, reason)
-        st.session_state.active_trade = trade_id
+        # 2. Check Exit Conditions
+        tp_target = trade['entry_price'] * (1 + AlgoConfig.TAKE_PROFIT_PCT)
+        exit_reason = None
+        
+        if current_ltp >= tp_target:
+            exit_reason = "TAKE_PROFIT_HIT"
+        elif current_ltp <= trade['current_sl']:
+            exit_reason = "TRAILING_SL_HIT"
+
+        if exit_reason:
+            pnl_points = current_ltp - trade['entry_price']
+            pnl_inr = pnl_points * AlgoConfig.LOT_SIZE
+            db.close_trade(trade['trade_id'], current_ltp, pnl_points, pnl_inr, exit_reason)
+            st.warning(f"🔔 TRADE CLOSED ({exit_reason}): Exited at ₹{current_ltp:.2f} | P&L: ₹{pnl_inr:.2f}")
+            st.session_state.active_trade = None
+
+    # --- UPDATED: Signal Generation (Only check if no active trade) ---
+    signal = None
+    entry = 0
+    sl = 0
+    if not st.session_state.active_trade:
+        if idx_dir == "Bullish" and ce_type == "Bullish" and pe_type == "Bearish":
+            signal = "BUY CE"
+            entry = live_data['ce_ltp']
+            sl = min(ce_df.iloc[-2]['Low'], entry * (1 - AlgoConfig.SL_PCT))
+        elif idx_dir == "Bearish" and pe_type == "Bullish" and ce_type == "Bearish":
+            signal = "BUY PE"
+            entry = live_data['pe_ltp']
+            sl = min(pe_df.iloc[-2]['Low'], entry * (1 - AlgoConfig.SL_PCT))
+
+        if signal:
+            reason = f"CE: {ce_type}({ce_pat}) | PE: {pe_type}({pe_pat})"
+            trade_id = db.log_trade(signal, live_data['strike'], entry, sl, reason)
+            
+            # Store full trade object in session state instead of just the ID
+            st.session_state.active_trade = {
+                'trade_id': trade_id,
+                'signal': signal,
+                'entry_price': entry,
+                'highest_price': entry,
+                'current_sl': sl
+            }
 
     st.markdown(f"### Spot: {live_data['spot']:.2f} | Target Strike: {live_data['strike']}")
     
@@ -216,11 +270,18 @@ if live_data:
         st.line_chart(pe_df['Close'])
 
     if signal:
-        st.success(f"🚨 TRADE TRIGGERED: {signal} at ₹{entry:.2f} | Stoploss: ₹{sl:.2f}")
+        st.success(f"🚨 TRADE TRIGGERED: {signal} at ₹{entry:.2f} | Initial Stoploss: ₹{sl:.2f}")
+
+    if st.session_state.active_trade:
+        tr = st.session_state.active_trade
+        current_ltp = live_data['ce_ltp'] if 'CE' in tr['signal'] else live_data['pe_ltp']
+        unrealized_pnl = (current_ltp - tr['entry_price']) * AlgoConfig.LOT_SIZE
+        st.info(f"🟢 **ACTIVE POSITION:** {tr['signal']} | **Entry:** ₹{tr['entry_price']:.2f} | **Current LTP:** ₹{current_ltp:.2f} | **Trailing SL:** ₹{tr['current_sl']:.2f} | **Unrealized P&L:** ₹{unrealized_pnl:.2f}")
+
 else:
     st.warning("Fetching NSE Data... (Waiting for market open or bypassing rate limits. If market is closed, data will be unavailable.)")
 
-    # ==========================================
+# ==========================================
 # 6. Database Viewer (NEW SECTION)
 # ==========================================
 st.divider()
