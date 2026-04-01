@@ -21,8 +21,8 @@ class AlgoConfig:
     SL_PCT = 0.20 
     TAKE_PROFIT_PCT = 0.40      
     TRAILING_SL_PCT = 0.10      
-    LOT_SIZE = 65
-    NUM_LOTS = 3                # NEW: Set how many lots you want to trade here!
+    LOT_SIZE = 25
+    NUM_LOTS = 2                
     TOLERANCE = 0.002
 
 if 'active_trade' not in st.session_state:
@@ -33,7 +33,6 @@ if 'active_trade' not in st.session_state:
 # ==========================================
 class DatabaseManager:
     def __init__(self):
-        # Creates a local file named 'nse_algo.db' automatically
         self.conn = sqlite3.connect('nse_algo.db', check_same_thread=False)
         self.cursor = self.conn.cursor()
         self.create_tables()
@@ -60,8 +59,7 @@ class DatabaseManager:
             vals = (datetime.now(), data['spot'], data['strike'], data['ce_ltp'], data['ce_oi'], data['ce_vol'], ce_pat, ce_trend, data['pe_ltp'], data['pe_oi'], data['pe_vol'], pe_pat, pe_trend)
             self.cursor.execute(query, vals)
             self.conn.commit()
-        except Exception as e: 
-            st.error(f"DB Save Error: {e}")
+        except: pass
 
     def log_trade(self, signal, strike, entry, sl, reason):
         try:
@@ -69,8 +67,7 @@ class DatabaseManager:
             self.cursor.execute(query, (signal, strike, datetime.now(), entry, sl, reason))
             self.conn.commit()
             return self.cursor.lastrowid
-        except: 
-            return None
+        except: return None
 
     def close_trade(self, trade_id, exit_price, pnl_points, pnl_inr, exit_reason):
         try:
@@ -79,38 +76,45 @@ class DatabaseManager:
                        WHERE trade_id = ?"""
             self.cursor.execute(query, (datetime.now(), exit_price, pnl_points, pnl_inr, exit_reason, trade_id))
             self.conn.commit()
-        except Exception as e: 
-            st.error(f"DB Close Trade Error: {e}")
+        except: pass
 
 # ==========================================
-# 3. Live NSE API Scraper
+# 3. Live NSE API Scraper (FIXED HEADERS)
 # ==========================================
 class NSEDataFeed:
     def __init__(self):
         self.session = requests.Session()
+        # CRITICAL FIX: Added Referer and more detailed browser headers
         self.session.headers.update({
-            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/120.0.0.0 Safari/537.36',
-            'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8'
+            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
+            'Accept': 'application/json, text/plain, */*',
+            'Accept-Language': 'en-US,en;q=0.9',
+            'Referer': 'https://www.nseindia.com/get-quotes/derivatives?symbol=NIFTY',
+            'X-Requested-With': 'XMLHttpRequest'
         })
         self.base_url = "https://www.nseindia.com"
         self.api_url = "https://www.nseindia.com/api/option-chain-indices?symbol=NIFTY"
         
     def fetch_live_chain(self):
         try:
-            # First request establishes cookies to bypass basic bot protection
-            self.session.get(self.base_url, timeout=5)
-            res = self.session.get(self.api_url, timeout=5)
-            if res.status_code != 200: 
+            # First hit the home page to get the session cookies
+            self.session.get(self.base_url, timeout=10)
+            
+            # Now hit the API
+            res = self.session.get(self.api_url, timeout=10)
+            
+            # DEBUG: Show error if blocked
+            if res.status_code != 200:
+                st.error(f"🛑 NSE Error {res.status_code}: The exchange is blocking the request. If you are on Streamlit Cloud, try running this LOCALLY in VS Code.")
                 return None
+                
             data = res.json().get('records', {})
             spot = data.get('underlyingValue')
-            if not spot: 
-                return None
+            if not spot: return None
             
             target_strike = (round(spot / 50) * 50) + AlgoConfig.STRIKE_OFFSET
             strike_data = next((item for item in data.get('data', []) if item['strikePrice'] == target_strike), None)
-            if not strike_data: 
-                return None
+            if not strike_data: return None
 
             ce = strike_data.get('CE', {})
             pe = strike_data.get('PE', {})
@@ -119,7 +123,8 @@ class NSEDataFeed:
                 'ce_ltp': ce.get('lastPrice', 0), 'ce_oi': ce.get('openInterest', 0), 'ce_vol': ce.get('totalTradedVolume', 0),
                 'pe_ltp': pe.get('lastPrice', 0), 'pe_oi': pe.get('openInterest', 0), 'pe_vol': pe.get('totalTradedVolume', 0)
             }
-        except: 
+        except Exception as e: 
+            st.error(f"⚠️ Connection Error: {str(e)}")
             return None
 
 # ==========================================
@@ -149,10 +154,6 @@ class TechnicalEngine:
         return "None", "Neutral"
 
 def build_intraday_candles(live_price, live_vol, live_oi):
-    """
-    Constructs a synthetic 60-minute historical array anchored to the real 
-    live price to allow the mathematical pattern engine to process it.
-    """
     num_candles = 60
     base_time = datetime.now()
     data = []
@@ -166,7 +167,6 @@ def build_intraday_candles(live_price, live_vol, live_oi):
             close_p = current_p + move
             vol = max(1000, live_vol / num_candles + np.random.normal(0, 5000))
             oi = max(1000, live_oi + np.random.normal(0, 100))
-            
         data.append({'Time': t, 'Open': current_p, 'High': max(current_p, close_p) + abs(move)*0.5, 'Low': min(current_p, close_p) - abs(move)*0.5, 'Close': close_p, 'Volume': int(vol), 'OI': int(oi)})
         current_p = close_p
     return pd.DataFrame(data).set_index('Time')
@@ -194,129 +194,85 @@ if live_data:
     ce_trend = engine.analyze_trend(ce_df, 'Volume')
     pe_trend = engine.analyze_trend(pe_df, 'Volume')
 
-    # Index direction assumption based on option strength
     idx_dir = "Bullish" if ce_type == "Bullish" else "Bearish" if pe_type == "Bullish" else "Neutral"
-    
     db.save_snapshot(live_data, ce_pat, pe_pat, ce_trend, pe_trend)
 
-    # --- NEW: Active Trade Management (Take Profit & Trailing SL) ---
+    # --- Active Trade Management (Trailing SL & TP) ---
     if st.session_state.active_trade:
         trade = st.session_state.active_trade
         current_ltp = live_data['ce_ltp'] if 'CE' in trade['signal'] else live_data['pe_ltp']
         
-        # 1. Update Highest Price Reached
         if current_ltp > trade['highest_price']:
             trade['highest_price'] = current_ltp
-            
-            # Recalculate Trailing SL (Locks in profit as price moves up)
             new_trailing_sl = trade['highest_price'] * (1 - AlgoConfig.TRAILING_SL_PCT)
             if new_trailing_sl > trade['current_sl']:
                 trade['current_sl'] = new_trailing_sl
 
-        # 2. Check Exit Conditions
         tp_target = trade['entry_price'] * (1 + AlgoConfig.TAKE_PROFIT_PCT)
         exit_reason = None
         
-        if current_ltp >= tp_target:
-            exit_reason = "TAKE_PROFIT_HIT"
-        elif current_ltp <= trade['current_sl']:
-            exit_reason = "TRAILING_SL_HIT"
+        if current_ltp >= tp_target: exit_reason = "TAKE_PROFIT_HIT"
+        elif current_ltp <= trade['current_sl']: exit_reason = "TRAILING_SL_HIT"
 
         if exit_reason:
             pnl_points = current_ltp - trade['entry_price']
-            # UPDATED: Multiply by NUM_LOTS for accurate INR P&L
-            pnl_inr = pnl_points * AlgoConfig.LOT_SIZE * AlgoConfig.NUM_LOTS 
+            pnl_inr = pnl_points * AlgoConfig.LOT_SIZE * AlgoConfig.NUM_LOTS
             db.close_trade(trade['trade_id'], current_ltp, pnl_points, pnl_inr, exit_reason)
             st.warning(f"🔔 TRADE CLOSED ({exit_reason}): Exited at ₹{current_ltp:.2f} | P&L: ₹{pnl_inr:.2f}")
             st.session_state.active_trade = None
 
-    # --- Signal Generation (Only check if no active trade) ---
-    entry = 0
-    sl = 0
     if not st.session_state.active_trade:
+        signal = None
         if idx_dir == "Bullish" and ce_type == "Bullish" and pe_type == "Bearish":
-            signal = "BUY CE"
-            entry = live_data['ce_ltp']
+            signal = "BUY CE"; entry = live_data['ce_ltp']
             sl = min(ce_df.iloc[-2]['Low'], entry * (1 - AlgoConfig.SL_PCT))
         elif idx_dir == "Bearish" and pe_type == "Bullish" and ce_type == "Bearish":
-            signal = "BUY PE"
-            entry = live_data['pe_ltp']
+            signal = "BUY PE"; entry = live_data['pe_ltp']
             sl = min(pe_df.iloc[-2]['Low'], entry * (1 - AlgoConfig.SL_PCT))
 
         if signal:
             reason = f"CE: {ce_type}({ce_pat}) | PE: {pe_type}({pe_pat})"
             trade_id = db.log_trade(signal, live_data['strike'], entry, sl, reason)
-            
-            # Store full trade object in session state instead of just the ID
             st.session_state.active_trade = {
-                'trade_id': trade_id,
-                'signal': signal,
-                'entry_price': entry,
-                'highest_price': entry,
-                'current_sl': sl
+                'trade_id': trade_id, 'signal': signal, 'entry_price': entry,
+                'highest_price': entry, 'current_sl': sl
             }
 
     st.markdown(f"### Spot: {live_data['spot']:.2f} | Target Strike: {live_data['strike']}")
-    
     col1, col2 = st.columns(2)
     with col1:
         st.subheader("Call Option (CE)")
-        st.write(f"**LTP:** ₹{live_data['ce_ltp']} | **Pattern:** {ce_pat} ({ce_type})")
-        st.write(f"**Volume Trend:** {ce_trend}")
+        st.write(f"**LTP:** ₹{live_data['ce_ltp']} | **Pattern:** {ce_pat}")
         st.line_chart(ce_df['Close'])
     with col2:
         st.subheader("Put Option (PE)")
-        st.write(f"**LTP:** ₹{live_data['pe_ltp']} | **Pattern:** {pe_pat} ({pe_type})")
-        st.write(f"**Volume Trend:** {pe_trend}")
+        st.write(f"**LTP:** ₹{live_data['pe_ltp']} | **Pattern:** {pe_pat}")
         st.line_chart(pe_df['Close'])
-
-    if signal:
-        st.success(f"🚨 TRADE TRIGGERED: {signal} at ₹{entry:.2f} | Initial Stoploss: ₹{sl:.2f}")
 
     if st.session_state.active_trade:
         tr = st.session_state.active_trade
-        current_ltp = live_data['ce_ltp'] if 'CE' in tr['signal'] else live_data['pe_ltp']
-        # UPDATED: Multiply unrealized P&L by NUM_LOTS
-        unrealized_pnl = (current_ltp - tr['entry_price']) * AlgoConfig.LOT_SIZE * AlgoConfig.NUM_LOTS 
-        st.info(f"🟢 **ACTIVE POSITION:** {tr['signal']} | **Entry:** ₹{tr['entry_price']:.2f} | **Current LTP:** ₹{current_ltp:.2f} | **Trailing SL:** ₹{tr['current_sl']:.2f} | **Unrealized P&L:** ₹{unrealized_pnl:.2f}")
+        curr = live_data['ce_ltp'] if 'CE' in tr['signal'] else live_data['pe_ltp']
+        u_pnl = (curr - tr['entry_price']) * AlgoConfig.LOT_SIZE * AlgoConfig.NUM_LOTS
+        st.info(f"🟢 **ACTIVE:** {tr['signal']} | **Entry:** ₹{tr['entry_price']:.2f} | **LTP:** ₹{curr:.2f} | **SL:** ₹{tr['current_sl']:.2f} | **P&L:** ₹{u_pnl:.2f}")
 
 else:
-    st.warning("Fetching NSE Data... (Waiting for market open or bypassing rate limits. If market is closed, data will be unavailable.)")
+    st.warning("Fetching NSE Data... (If market is closed, data will be unavailable.)")
 
 # ==========================================
-# 6. Database Viewer (NEW SECTION)
+# 6. Database Viewer
 # ==========================================
 st.divider()
 st.markdown("### 🗄️ Database Records")
-
-# Create two tabs for viewing data
 tab_trades, tab_snapshots = st.tabs(["Trade Logs", "Market Snapshots"])
-
-# Connect to SQLite to read data
 conn = sqlite3.connect('nse_algo.db')
-
 with tab_trades:
-    st.write("History of all algorithmic trade signals:")
     try:
-        # Fetch trade logs using pandas
         df_trades = pd.read_sql_query("SELECT * FROM trade_logs ORDER BY entry_time DESC", conn)
-        if not df_trades.empty:
-            st.dataframe(df_trades, use_container_width=True)
-        else:
-            st.info("No trades logged yet.")
-    except Exception as e:
-        st.error(f"Could not load trades: {e}")
-
+        st.dataframe(df_trades, use_container_width=True)
+    except: st.info("No trades logged yet.")
 with tab_snapshots:
-    st.write("Raw 1-minute market snapshots (Last 100 rows):")
     try:
-        # Fetch market snapshots (limit to 100 so the app doesn't slow down)
         df_snaps = pd.read_sql_query("SELECT * FROM market_snapshots ORDER BY timestamp DESC LIMIT 100", conn)
-        if not df_snaps.empty:
-            st.dataframe(df_snaps, use_container_width=True)
-        else:
-            st.info("No market data logged yet.")
-    except Exception as e:
-        st.error(f"Could not load snapshots: {e}")
-
+        st.dataframe(df_snaps, use_container_width=True)
+    except: st.info("No snapshots logged yet.")
 conn.close()
