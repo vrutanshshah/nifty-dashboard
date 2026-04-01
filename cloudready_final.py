@@ -2,40 +2,55 @@ import streamlit as st
 import pandas as pd
 import numpy as np
 import plotly.graph_objects as go
+from plotly.subplots import make_subplots
 from scipy.signal import argrelextrema
-from scipy.stats import linregress
+from scipy.stats import linregress, norm
 from datetime import datetime, timedelta
 import pytz
-import requests
-import time
 import sqlite3
+import yfinance as yf
+from streamlit_autorefresh import st_autorefresh
 
 # ==========================================
-# 1. Configuration & State
+# 1. Configuration & State Initialization
 # ==========================================
-st.set_page_config(page_title="Live Nifty Options Algo", layout="wide", page_icon="⚡")
+st.set_page_config(page_title="Nifty Master Algo: Ultra-Aggressive", layout="wide", page_icon="⚡")
 IST = pytz.timezone('Asia/Kolkata')
 
-class AlgoConfig:
-    STRIKE_OFFSET = 100 
-    SL_PCT = 0.20 
-    TAKE_PROFIT_PCT = 0.40      
-    TRAILING_SL_PCT = 0.10      
-    LOT_SIZE = 25
-    NUM_LOTS = 2                
-    TOLERANCE = 0.002
-
+# --- FAILSAFE INITIALIZATION ---
 if 'active_trade' not in st.session_state:
     st.session_state.active_trade = None
 
+class AlgoConfig:
+    STRIKE_OFFSET = 100     # Default offset from ATM
+    SL_PCT = 0.20           
+    TAKE_PROFIT_PCT = 0.40      
+    TRAILING_SL_PCT = 0.05  
+    TRAILING_ACTIVATION_PCT = 0.10 
+    LOT_SIZE = 65           # PERMANENT
+    NUM_LOTS = 3            # PERMANENT                
+    TOLERANCE = 0.002       
+    
+    # --- Logic Settings ---
+    BREAKOUT_WINDOW = 10        
+    VOL_MA_PERIOD = 20          
+    
+    # --- Pricing Parameter Defaults ---
+    RISK_FREE_RATE = 0.07       
+    DEFAULT_CE_IV = 0.23        
+    DEFAULT_PE_IV = 0.29        
+    EXPIRY_DATE = "2026-04-07"  
+    DEFAULT_FUTURES_PREMIUM = 100.0      
+
 # ==========================================
-# 2. Database Manager (Cloud Ready SQLite)
+# 2. Database Manager
 # ==========================================
 class DatabaseManager:
     def __init__(self):
         self.conn = sqlite3.connect('nse_algo.db', check_same_thread=False)
         self.cursor = self.conn.cursor()
         self.create_tables()
+        self.migrate_schema() 
 
     def create_tables(self):
         self.cursor.execute('''CREATE TABLE IF NOT EXISTS market_snapshots 
@@ -47,9 +62,25 @@ class DatabaseManager:
         self.cursor.execute('''CREATE TABLE IF NOT EXISTS trade_logs 
             (trade_id INTEGER PRIMARY KEY AUTOINCREMENT, trade_type TEXT, 
             strike INTEGER, entry_time DATETIME, entry_price REAL, 
-            stop_loss REAL, entry_reason TEXT, exit_time DATETIME, 
-            exit_price REAL, pnl_points REAL, pnl_inr REAL, status TEXT DEFAULT 'OPEN')''')
+            stop_loss REAL, highest_price REAL, entry_reason TEXT, exit_time DATETIME, 
+            exit_price REAL, pnl_points REAL, pnl_inr REAL, 
+            status TEXT DEFAULT 'OPEN')''')
         self.conn.commit()
+
+    def migrate_schema(self):
+        try:
+            self.cursor.execute("ALTER TABLE trade_logs ADD COLUMN highest_price REAL")
+            self.conn.commit()
+        except: pass 
+
+    def get_active_trade_from_db(self):
+        try:
+            query = "SELECT * FROM trade_logs WHERE status = 'OPEN' LIMIT 1"
+            df = pd.read_sql_query(query, self.conn)
+            if not df.empty:
+                return df.iloc[0].to_dict()
+            return None
+        except: return None
 
     def save_snapshot(self, data, ce_pat, pe_pat, ce_trend, pe_trend):
         try:
@@ -63,11 +94,18 @@ class DatabaseManager:
 
     def log_trade(self, signal, strike, entry, sl, reason):
         try:
-            query = "INSERT INTO trade_logs (trade_type, strike, entry_time, entry_price, stop_loss, entry_reason) VALUES (?, ?, ?, ?, ?, ?)"
-            self.cursor.execute(query, (signal, strike, datetime.now(), entry, sl, reason))
+            query = "INSERT INTO trade_logs (trade_type, strike, entry_time, entry_price, stop_loss, highest_price, entry_reason, status) VALUES (?, ?, ?, ?, ?, ?, ?, 'OPEN')"
+            self.cursor.execute(query, (signal, strike, datetime.now(), entry, sl, entry, reason))
             self.conn.commit()
             return self.cursor.lastrowid
         except: return None
+
+    def update_trade_sl(self, trade_id, highest_price, stop_loss):
+        try:
+            query = "UPDATE trade_logs SET highest_price = ?, stop_loss = ? WHERE trade_id = ?"
+            self.cursor.execute(query, (highest_price, stop_loss, trade_id))
+            self.conn.commit()
+        except: pass
 
     def close_trade(self, trade_id, exit_price, pnl_points, pnl_inr, exit_reason):
         try:
@@ -79,78 +117,85 @@ class DatabaseManager:
         except: pass
 
 # ==========================================
-# 3. Live NSE API Scraper (FIXED HEADERS)
+# 3. Quantitative Engine: Black-76 Pricing
 # ==========================================
-class NSEDataFeed:
-    def __init__(self):
-        self.session = requests.Session()
-        # CRITICAL FIX: Added Referer and more detailed browser headers
-        self.session.headers.update({
-            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
-            'Accept': 'application/json, text/plain, */*',
-            'Accept-Language': 'en-US,en;q=0.9',
-            'Referer': 'https://www.nseindia.com/get-quotes/derivatives?symbol=NIFTY',
-            'X-Requested-With': 'XMLHttpRequest'
-        })
-        self.base_url = "https://www.nseindia.com"
-        self.api_url = "https://www.nseindia.com/api/option-chain-indices?symbol=NIFTY"
+class BlackScholes:
+    @staticmethod
+    def price(F, K, T, r, sigma, option_type='call'):
+        T = max(T, 1e-5) 
+        d1 = (np.log(F / K) + (0.5 * sigma ** 2) * T) / (sigma * np.sqrt(T))
+        d2 = d1 - sigma * np.sqrt(T)
+        if option_type == 'call':
+            return np.exp(-r * T) * (F * norm.cdf(d1) - K * norm.cdf(d2))
+        else:
+            return np.exp(-r * T) * (K * norm.cdf(-d2) - F * norm.cdf(-d1))
+
+# ==========================================
+# 4. Data Layer (YFinance + Synthetic Pipeline)
+# ==========================================
+@st.cache_data(ttl=30)
+def get_nifty_spot_data():
+    try:
+        nifty = yf.Ticker("^NSEI")
+        df = nifty.history(period="10d", interval="5m")
+        return df
+    except: return pd.DataFrame()
+
+class SyntheticDataFeed:
+    def fetch_live_options(self, spot_price, futures_premium, ce_iv, pe_iv, strike_offset):
+        expiry_date = datetime.strptime(AlgoConfig.EXPIRY_DATE, "%Y-%m-%d").date()
+        current_date = datetime.now(IST).date()
+        dte = max((expiry_date - current_date).days, 1) 
+        T = dte / 365.0
+        r = AlgoConfig.RISK_FREE_RATE
         
-    def fetch_live_chain(self):
-        try:
-            # First hit the home page to get the session cookies
-            self.session.get(self.base_url, timeout=10)
-            
-            # Now hit the API
-            res = self.session.get(self.api_url, timeout=10)
-            
-            # DEBUG: Show error if blocked
-            if res.status_code != 200:
-                st.error(f"🛑 NSE Error {res.status_code}: The exchange is blocking the request. If you are on Streamlit Cloud, try running this LOCALLY in VS Code.")
-                return None
-                
-            data = res.json().get('records', {})
-            spot = data.get('underlyingValue')
-            if not spot: return None
-            
-            target_strike = (round(spot / 50) * 50) + AlgoConfig.STRIKE_OFFSET
-            strike_data = next((item for item in data.get('data', []) if item['strikePrice'] == target_strike), None)
-            if not strike_data: return None
-
-            ce = strike_data.get('CE', {})
-            pe = strike_data.get('PE', {})
-            return {
-                'spot': spot, 'strike': target_strike,
-                'ce_ltp': ce.get('lastPrice', 0), 'ce_oi': ce.get('openInterest', 0), 'ce_vol': ce.get('totalTradedVolume', 0),
-                'pe_ltp': pe.get('lastPrice', 0), 'pe_oi': pe.get('openInterest', 0), 'pe_vol': pe.get('totalTradedVolume', 0)
-            }
-        except Exception as e: 
-            st.error(f"⚠️ Connection Error: {str(e)}")
-            return None
+        futures_price = spot_price + futures_premium
+        # Calculate Target Strike using dynamic offset
+        target_strike = (int(round(futures_price / 50.0)) * 50) + strike_offset
+        
+        ce_theo = BlackScholes.price(futures_price, target_strike, T, r, ce_iv, 'call')
+        pe_theo = BlackScholes.price(futures_price, target_strike, T, r, pe_iv, 'put')
+        
+        return {
+            'spot': spot_price, 'futures_price': futures_price, 'strike': target_strike, 'dte': dte,
+            'ce_ltp': round(max(0.5, ce_theo + np.random.normal(0, 1.5)), 2), 
+            'ce_oi': int(2500000 + np.random.normal(0, 15000)), 'ce_vol': int(1500000 + np.random.normal(0, 25000)),
+            'pe_ltp': round(max(0.5, pe_theo + np.random.normal(0, 1.5)), 2), 
+            'pe_oi': int(2000000 + np.random.normal(0, 15000)), 'pe_vol': int(1200000 + np.random.normal(0, 25000)),
+            'feed_mode': '🟢 BLACK-76 OPTIONS FEED'
+        }
 
 # ==========================================
-# 4. Technical Engine (Maths & Patterns)
+# 5. Technical Engine (Patterns & Trends)
 # ==========================================
 class TechnicalEngine:
     @staticmethod
-    def analyze_trend(df, col, period=10):
-        if len(df) < period: return "Flat"
-        slope = linregress(range(period), df[col].tail(period))[0]
-        return "Increasing ↗" if slope > 0 else "Decreasing ↘"
+    def check_breakout(df, window=10):
+        if len(df) < window + 1: return "Neutral"
+        lookback = df.iloc[-(window+1):-1]
+        resistance = lookback['High'].max()
+        support = lookback['Low'].min()
+        current_close = df.iloc[-1]['Close']
+        if current_close > resistance: return "Bullish Breakout"
+        if current_close < support: return "Bearish Breakdown"
+        return "Neutral"
 
     @staticmethod
-    def detect_pattern(df):
-        if len(df) < 30: return "None", "Neutral"
-        peaks = argrelextrema(df['High'].values, np.greater, order=3)[0]
-        troughs = argrelextrema(df['Low'].values, np.less, order=3)[0]
-        if len(peaks) < 3 or len(troughs) < 3: return "None", "Neutral"
+    def detect_pattern(df, order=1): 
+        if len(df) < 20: return "None", "Neutral"
+        peaks = argrelextrema(df['High'].values, np.greater, order=order)[0]
+        troughs = argrelextrema(df['Low'].values, np.less, order=order)[0]
+        if len(peaks) < 2 or len(troughs) < 2: return "None", "Neutral"
         
         last_peaks = df.iloc[peaks[-3:]]['High'].values
         last_troughs = df.iloc[troughs[-3:]]['Low'].values
         close = df.iloc[-1]['Close']
         tol = close * AlgoConfig.TOLERANCE
 
-        if abs(last_troughs[-1] - last_troughs[-2]) <= tol and close > last_peaks[-1]: return "Double Bottom", "Bullish"
-        if abs(last_peaks[-1] - last_peaks[-2]) <= tol and close < last_troughs[-1]: return "Double Top", "Bearish"
+        if abs(last_troughs[-1] - last_troughs[-2]) <= tol and close > last_troughs[-1]:
+            return "Double Bottom (Fast)", "Bullish"
+        if abs(last_peaks[-1] - last_peaks[-2]) <= tol and close < last_peaks[-1]:
+            return "Double Top (Fast)", "Bearish"
         return "None", "Neutral"
 
 def build_intraday_candles(live_price, live_vol, live_oi):
@@ -161,118 +206,193 @@ def build_intraday_candles(live_price, live_vol, live_oi):
     for i in range(num_candles):
         t = base_time - timedelta(minutes=num_candles - i)
         move = np.random.normal(0, live_price * 0.005) 
-        if i == num_candles - 1:
-            close_p, vol, oi = live_price, live_vol, live_oi
-        else:
-            close_p = current_p + move
-            vol = max(1000, live_vol / num_candles + np.random.normal(0, 5000))
-            oi = max(1000, live_oi + np.random.normal(0, 100))
-        data.append({'Time': t, 'Open': current_p, 'High': max(current_p, close_p) + abs(move)*0.5, 'Low': min(current_p, close_p) - abs(move)*0.5, 'Close': close_p, 'Volume': int(vol), 'OI': int(oi)})
+        close_p = current_p + move if i != num_candles - 1 else live_price
+        data.append({'Time': t, 'Open': current_p, 'High': max(current_p, close_p) + abs(move)*0.5, 'Low': min(current_p, close_p) - abs(move)*0.5, 'Close': close_p, 'Volume': int(live_vol/num_candles), 'OI': int(live_oi)})
         current_p = close_p
-    return pd.DataFrame(data).set_index('Time')
+    return pd.DataFrame(data).set_index('Time').sort_index()
 
 # ==========================================
-# 5. Main Execution Loop
+# 6. Main Execution Loop
 # ==========================================
-st.title("⚡ NSE Live: Advanced Multi-Leg Options Algo")
-auto_refresh = st.sidebar.checkbox("Auto-Refresh (1 Min)", value=False)
-if auto_refresh: 
-    time.sleep(60)
-    st.rerun()
+st.sidebar.title("🛠️ Settings & Controls")
 
-nse = NSEDataFeed()
+st.sidebar.markdown("### 📊 Pricing Inputs")
+live_ce_iv = st.sidebar.slider("Call IV (CE %)", 5, 100, int(AlgoConfig.DEFAULT_CE_IV * 100), step=1) / 100.0
+live_pe_iv = st.sidebar.slider("Put IV (PE %)", 5, 100, int(AlgoConfig.DEFAULT_PE_IV * 100), step=1) / 100.0
+live_fut_prem = st.sidebar.slider("Futures Premium (Pts)", 0, 500, int(AlgoConfig.DEFAULT_FUTURES_PREMIUM), step=5)
+
+# --- NEW: STRIKE PRICE CONTROL ---
+st.sidebar.markdown("### 🎯 Selection")
+live_strike_offset = st.sidebar.slider("Strike Offset (from ATM)", -500, 500, int(AlgoConfig.STRIKE_OFFSET), step=50, help="Shift target strike. Positive = OTM Call / ITM Put.")
+
+st.sidebar.divider()
+auto_refresh = st.sidebar.checkbox("Auto-Refresh (1 Min)", value=True)
+
+col_title, col_btn = st.columns([5, 1])
+with col_title:
+    st.title("⚡ Master Algo: ULTRA-AGGRESSIVE")
+with col_btn:
+    st.write(""); 
+    if st.button("🔄 Refresh Data", use_container_width=True): st.rerun()
+
+if auto_refresh:
+    st_autorefresh(interval=60000, limit=None, key="algo_refresh")
+
 db = DatabaseManager()
-live_data = nse.fetch_live_chain()
+if st.session_state.active_trade is None:
+    st.session_state.active_trade = db.get_active_trade_from_db()
 
-if live_data:
-    ce_df = build_intraday_candles(live_data['ce_ltp'], live_data['ce_vol'], live_data['ce_oi'])
-    pe_df = build_intraday_candles(live_data['pe_ltp'], live_data['pe_vol'], live_data['pe_oi'])
+nifty_df = get_nifty_spot_data()
+
+if not nifty_df.empty:
+    current_spot = nifty_df['Close'].iloc[-1]
+    
+    # Indicators calculation
+    nifty_df['EMA_20'] = nifty_df['Close'].ewm(span=20, adjust=False).mean()
+    nifty_df['EMA_50'] = nifty_df['Close'].ewm(span=50, adjust=False).mean()
+    nifty_df['EMA_200'] = nifty_df['Close'].ewm(span=200, adjust=False).mean()
+    nifty_df['Vol_MA'] = nifty_df['Volume'].rolling(window=AlgoConfig.VOL_MA_PERIOD).mean()
+    
+    delta = nifty_df['Close'].diff()
+    gain = delta.where(delta > 0, 0); loss = -delta.where(delta < 0, 0)
+    avg_gain = gain.ewm(alpha=1/14, adjust=False).mean(); avg_loss = loss.ewm(alpha=1/14, adjust=False).mean()
+    nifty_df['RSI'] = 100 - (100 / (1 + avg_gain / avg_loss))
     
     engine = TechnicalEngine()
-    ce_pat, ce_type = engine.detect_pattern(ce_df)
-    pe_pat, pe_type = engine.detect_pattern(pe_df)
-    ce_trend = engine.analyze_trend(ce_df, 'Volume')
-    pe_trend = engine.analyze_trend(pe_df, 'Volume')
+    nifty_pat, nifty_pat_type = engine.detect_pattern(nifty_df, order=1)
+    nifty_breakout = engine.check_breakout(nifty_df, window=AlgoConfig.BREAKOUT_WINDOW)
+    
+    # --- Index Bias Logic ---
+    latest = nifty_df.iloc[-1]
+    prev = nifty_df.iloc[-2]
+    trend_score = 0
+    if latest['EMA_20'] > latest['EMA_50'] > latest['EMA_200']: trend_score += 1
+    elif latest['EMA_20'] < latest['EMA_50'] < latest['EMA_200']: trend_score -= 1
+    if latest['RSI'] > 50: trend_score += 1 
+    elif latest['RSI'] < 50: trend_score -= 1
+    vol_confirmed = latest['Volume'] > latest['Vol_MA']
+    if prev['Close'] < prev['EMA_20'] and latest['Close'] > latest['EMA_20'] and vol_confirmed: trend_score += 1 
+    elif prev['Close'] > prev['EMA_20'] and latest['Close'] < latest['EMA_20'] and vol_confirmed: trend_score -= 1 
+    
+    idx_dir = "Bullish" if ("Bullish" in nifty_breakout or nifty_pat_type == "Bullish" or trend_score >= 1) else "Bearish" if ("Bearish" in nifty_breakout or nifty_pat_type == "Bearish" or trend_score <= -1) else "Neutral"
 
-    idx_dir = "Bullish" if ce_type == "Bullish" else "Bearish" if pe_type == "Bullish" else "Neutral"
-    db.save_snapshot(live_data, ce_pat, pe_pat, ce_trend, pe_trend)
-
-    # --- Active Trade Management (Trailing SL & TP) ---
+    # Pass slider values including STRIKE OFFSET into the data feed
+    nse = SyntheticDataFeed()
+    live_data = nse.fetch_live_options(current_spot, live_fut_prem, live_ce_iv, live_pe_iv, live_strike_offset)
+    
+    # --- ACTIVE TRADE MANAGEMENT ---
+    floating_pnl = 0.0
+    status_text = "WAITING"
+    trade_just_closed = False 
+    
     if st.session_state.active_trade:
         trade = st.session_state.active_trade
-        current_ltp = live_data['ce_ltp'] if 'CE' in trade['signal'] else live_data['pe_ltp']
-        
-        if current_ltp > trade['highest_price']:
-            trade['highest_price'] = current_ltp
-            new_trailing_sl = trade['highest_price'] * (1 - AlgoConfig.TRAILING_SL_PCT)
-            if new_trailing_sl > trade['current_sl']:
-                trade['current_sl'] = new_trailing_sl
+        current_ltp = live_data['ce_ltp'] if 'CE' in trade['trade_type'] else live_data['pe_ltp']
+        entry_p = trade['entry_price']
+        floating_pnl = (current_ltp - entry_p) * AlgoConfig.LOT_SIZE * AlgoConfig.NUM_LOTS
+        status_text = f"ACTIVE: {trade['trade_type']}"
 
-        tp_target = trade['entry_price'] * (1 + AlgoConfig.TAKE_PROFIT_PCT)
-        exit_reason = None
+        highest_so_far = trade.get('highest_price') or entry_p
+        is_trailing_active = current_ltp >= (entry_p * (1 + AlgoConfig.TRAILING_ACTIVATION_PCT))
         
-        if current_ltp >= tp_target: exit_reason = "TAKE_PROFIT_HIT"
-        elif current_ltp <= trade['current_sl']: exit_reason = "TRAILING_SL_HIT"
-
+        if is_trailing_active and current_ltp > highest_so_far:
+            highest_so_far = current_ltp
+            trade['highest_price'] = highest_so_far
+            new_tsl = highest_so_far * (1 - AlgoConfig.TRAILING_SL_PCT)
+            if new_tsl > trade['stop_loss']:
+                trade['stop_loss'] = new_tsl
+                db.update_trade_sl(trade['trade_id'], highest_so_far, trade['stop_loss'])
+        
+        tp_target = entry_p * (1 + AlgoConfig.TAKE_PROFIT_PCT)
+        curr_sl = trade['stop_loss']
+        exit_reason = "TAKE_PROFIT" if current_ltp >= tp_target else "STOP_LOSS" if current_ltp <= curr_sl else None
+        
         if exit_reason:
-            pnl_points = current_ltp - trade['entry_price']
-            pnl_inr = pnl_points * AlgoConfig.LOT_SIZE * AlgoConfig.NUM_LOTS
-            db.close_trade(trade['trade_id'], current_ltp, pnl_points, pnl_inr, exit_reason)
-            st.warning(f"🔔 TRADE CLOSED ({exit_reason}): Exited at ₹{current_ltp:.2f} | P&L: ₹{pnl_inr:.2f}")
+            pts = current_ltp - entry_p
+            db.close_trade(trade['trade_id'], current_ltp, pts, floating_pnl, exit_reason)
             st.session_state.active_trade = None
+            trade_just_closed = True
 
-    if not st.session_state.active_trade:
-        signal = None
-        if idx_dir == "Bullish" and ce_type == "Bullish" and pe_type == "Bearish":
-            signal = "BUY CE"; entry = live_data['ce_ltp']
-            sl = min(ce_df.iloc[-2]['Low'], entry * (1 - AlgoConfig.SL_PCT))
-        elif idx_dir == "Bearish" and pe_type == "Bullish" and ce_type == "Bearish":
-            signal = "BUY PE"; entry = live_data['pe_ltp']
-            sl = min(pe_df.iloc[-2]['Low'], entry * (1 - AlgoConfig.SL_PCT))
+    # --- TOP ROW: COMMAND CENTER METRICS ---
+    m1, m2, m3, m4, m5, m6 = st.columns(6)
+    m1.metric("Live Spot", f"₹{current_spot:.2f}")
+    m2.metric("Index Pattern", nifty_pat, delta=nifty_pat_type)
+    m3.metric("Trend Score", trend_score, delta=idx_dir)
+    m4.metric("Active Strike", live_data['strike'])
+    m5.metric("Status", status_text)
+    m6.metric("Live P&L", f"₹{floating_pnl:.2f}")
 
+    st.divider()
+
+    # --- 2-DAY VIEW CHART ---
+    nifty_dates = pd.to_datetime(nifty_df.index).date
+    unique_dates = np.unique(nifty_dates)
+    display_dates = unique_dates[-2:] if len(unique_dates) >= 2 else unique_dates
+    nifty_display_df = nifty_df[np.isin(nifty_dates, display_dates)]
+
+    st.markdown(f"### 📈 Nifty 50 Trend")
+    fig = make_subplots(rows=3, cols=1, shared_xaxes=True, vertical_spacing=0.03, row_heights=[0.6, 0.2, 0.2])
+    fig.add_trace(go.Candlestick(x=nifty_display_df.index, open=nifty_display_df['Open'], high=nifty_display_df['High'], low=nifty_display_df['Low'], close=nifty_display_df['Close'], name='Nifty'), row=1, col=1)
+    fig.add_trace(go.Scatter(x=nifty_display_df.index, y=nifty_display_df['EMA_20'], line=dict(color='blue', width=1), name='EMA 20'), row=1, col=1)
+    fig.add_trace(go.Scatter(x=nifty_display_df.index, y=nifty_display_df['EMA_200'], line=dict(color='red', width=1), name='EMA 200'), row=1, col=1)
+    fig.add_trace(go.Bar(x=nifty_display_df.index, y=nifty_display_df['Volume'], name='Volume'), row=2, col=1)
+    fig.add_trace(go.Scatter(x=nifty_display_df.index, y=nifty_display_df['RSI'], name='RSI'), row=3, col=1)
+    fig.update_xaxes(rangebreaks=[dict(bounds=[15.5, 9.25], pattern="hour"), dict(bounds=["sat", "mon"])])
+    fig.update_layout(height=450, template='plotly_dark', xaxis_rangeslider_visible=False, margin=dict(l=0, r=0, t=10, b=0), showlegend=False)
+    st.plotly_chart(fig, use_container_width=True)
+
+    st.divider()
+    
+    ce_df = build_intraday_candles(live_data['ce_ltp'], live_data['ce_vol'], live_data['ce_oi'])
+    pe_df = build_intraday_candles(live_data['pe_ltp'], live_data['pe_vol'], live_data['pe_oi'])
+    ce_pat, ce_type = engine.detect_pattern(ce_df, order=1)
+    pe_pat, pe_type = engine.detect_pattern(pe_df, order=1)
+    db.save_snapshot(live_data, ce_pat, pe_pat, "Flat", "Flat")
+
+    # --- ENTRY GATE: ONLY 1 TRADE ALLOWED ---
+    if st.session_state.active_trade is None and not trade_just_closed:
+        signal = "BUY CE" if (idx_dir=="Bullish" and (ce_type=="Bullish" or pe_type=="Bearish")) else "BUY PE" if (idx_dir=="Bearish" and (pe_type=="Bullish" or ce_type=="Bearish")) else None
         if signal:
-            reason = f"CE: {ce_type}({ce_pat}) | PE: {pe_type}({pe_pat})"
-            trade_id = db.log_trade(signal, live_data['strike'], entry, sl, reason)
-            st.session_state.active_trade = {
-                'trade_id': trade_id, 'signal': signal, 'entry_price': entry,
-                'highest_price': entry, 'current_sl': sl
-            }
+            entry = live_data['ce_ltp'] if "CE" in signal else live_data['pe_ltp']
+            sl = entry * (1 - AlgoConfig.SL_PCT)
+            reason = f"IDX:{nifty_pat}|CE:{ce_pat}|PE:{pe_pat}"
+            t_id = db.log_trade(signal, live_data['strike'], entry, sl, reason)
+            st.session_state.active_trade = {'trade_id':t_id, 'trade_type':signal, 'entry_price':entry, 'highest_price':entry, 'stop_loss':sl}
 
-    st.markdown(f"### Spot: {live_data['spot']:.2f} | Target Strike: {live_data['strike']}")
-    col1, col2 = st.columns(2)
-    with col1:
-        st.subheader("Call Option (CE)")
+    c_ce, c_pe = st.columns(2)
+    with c_ce:
+        st.subheader(f"Call Option (CE) - Strike {live_data['strike']}")
         st.write(f"**LTP:** ₹{live_data['ce_ltp']} | **Pattern:** {ce_pat}")
-        st.line_chart(ce_df['Close'])
-    with col2:
-        st.subheader("Put Option (PE)")
+        fig_ce = go.Figure(data=[go.Candlestick(x=ce_df.index, open=ce_df['Open'], high=ce_df['High'], low=ce_df['Low'], close=ce_df['Close'])])
+        fig_ce.update_layout(height=280, template='plotly_dark', margin=dict(l=0, r=0, t=10, b=0), xaxis_rangeslider_visible=False)
+        st.plotly_chart(fig_ce, use_container_width=True)
+    with c_pe:
+        st.subheader(f"Put Option (PE) - Strike {live_data['strike']}")
         st.write(f"**LTP:** ₹{live_data['pe_ltp']} | **Pattern:** {pe_pat}")
-        st.line_chart(pe_df['Close'])
+        fig_pe = go.Figure(data=[go.Candlestick(x=pe_df.index, open=pe_df['Open'], high=pe_df['High'], low=pe_df['Low'], close=pe_df['Close'])])
+        fig_pe.update_layout(height=280, template='plotly_dark', margin=dict(l=0, r=0, t=10, b=0), xaxis_rangeslider_visible=False)
+        st.plotly_chart(fig_pe, use_container_width=True)
 
     if st.session_state.active_trade:
         tr = st.session_state.active_trade
-        curr = live_data['ce_ltp'] if 'CE' in tr['signal'] else live_data['pe_ltp']
-        u_pnl = (curr - tr['entry_price']) * AlgoConfig.LOT_SIZE * AlgoConfig.NUM_LOTS
-        st.info(f"🟢 **ACTIVE:** {tr['signal']} | **Entry:** ₹{tr['entry_price']:.2f} | **LTP:** ₹{curr:.2f} | **SL:** ₹{tr['current_sl']:.2f} | **P&L:** ₹{u_pnl:.2f}")
+        curr = live_data['ce_ltp'] if 'CE' in tr['trade_type'] else live_data['pe_ltp']
+        col_info, col_manual = st.columns([4, 1])
+        col_info.info(f"🟢 **ACTIVE:** {tr['trade_type']} | **Entry:** ₹{tr['entry_price']:.2f} | **LTP:** ₹{curr:.2f} | **SL:** ₹{tr['stop_loss']:.2f} | **P&L:** ₹{(curr-tr['entry_price'])*AlgoConfig.LOT_SIZE*AlgoConfig.NUM_LOTS:.2f}")
+        if col_manual.button("❌ Square Off", use_container_width=True):
+            pts = curr - tr['entry_price']
+            final_pnl = pts * AlgoConfig.LOT_SIZE * AlgoConfig.NUM_LOTS
+            db.close_trade(tr['trade_id'], curr, pts, final_pnl, "MANUAL_EXIT")
+            st.session_state.active_trade = None
+            st.rerun()
 
-else:
-    st.warning("Fetching NSE Data... (If market is closed, data will be unavailable.)")
-
-# ==========================================
-# 6. Database Viewer
-# ==========================================
 st.divider()
 st.markdown("### 🗄️ Database Records")
-tab_trades, tab_snapshots = st.tabs(["Trade Logs", "Market Snapshots"])
+t1, t2 = st.tabs(["Trade Logs", "Market Snapshots"])
 conn = sqlite3.connect('nse_algo.db')
-with tab_trades:
-    try:
-        df_trades = pd.read_sql_query("SELECT * FROM trade_logs ORDER BY entry_time DESC", conn)
-        st.dataframe(df_trades, use_container_width=True)
+with t1:
+    try: st.dataframe(pd.read_sql_query("SELECT * FROM trade_logs ORDER BY entry_time DESC", conn), use_container_width=True)
     except: st.info("No trades logged yet.")
-with tab_snapshots:
-    try:
-        df_snaps = pd.read_sql_query("SELECT * FROM market_snapshots ORDER BY timestamp DESC LIMIT 100", conn)
-        st.dataframe(df_snaps, use_container_width=True)
+with t2:
+    try: st.dataframe(pd.read_sql_query("SELECT * FROM market_snapshots ORDER BY timestamp DESC LIMIT 100", conn), use_container_width=True)
     except: st.info("No snapshots logged yet.")
 conn.close()

@@ -5,3 +5,5 @@ scipy
 plotly
 pytz
 requests
+yfinance
+streamlit-autorefresh
